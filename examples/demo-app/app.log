@@ -1,0 +1,24 @@
+2026-11-20 11:58:01.120 INFO  demo-app started on http://127.0.0.1:18080
+2026-11-20 11:58:05.441 ERROR borrow failed TypeError: Cannot read properties of undefined (reading 'status')
+    at borrow (file:///D:/agentProject/bugKiller/examples/demo-app/server.mjs:10:15)
+    at Server.<anonymous> (file:///D:/agentProject/bugKiller/examples/demo-app/server.mjs:23:22)
+2026-11-20 11:58:05.442 WARN  request finished with status 500 for /api/borrow?id=NOT-EXIST&user=u1
+demo app on http://127.0.0.1:18080
+[BK:aaaaaaaa:H2:P1] "NOT-EXIST" ?id=NOT-EXIST&user=u1
+[BK:aaaaaaaa:H1:P1] NOT-EXIST true 2 [ 'E-1', 'E-2' ] u1
+borrow failed TypeError: Cannot read properties of undefined (reading 'status')
+    at borrow (file:///D:/agentProject/bugKiller/examples/demo-app/server.mjs:11:12)
+    at Server.<anonymous> (file:///D:/agentProject/bugKiller/examples/demo-app/server.mjs:32:22)
+    at Server.emit (node:events:508:28)
+    at parserOnIncoming (node:_http_server:1186:12)
+    at HTTPParser.parserOnHeadersComplete (node:_http_common:123:17)
+[BK:aaaaaaaa:H2:P1] "E-1" ?id=E-1&user=u1
+[BK:aaaaaaaa:H1:P1] E-1 false 2 [ 'E-1', 'E-2' ] u1
+[BK:aaaaaaaa:H2:P1] null ?user=u1
+[BK:aaaaaaaa:H1:P1] null true 2 [ 'E-1', 'E-2' ] u1
+borrow failed TypeError: Cannot read properties of undefined (reading 'status')
+    at borrow (file:///D:/agentProject/bugKiller/examples/demo-app/server.mjs:11:12)
+    at Server.<anonymous> (file:///D:/agentProject/bugKiller/examples/demo-app/server.mjs:32:22)
+    at Server.emit (node:events:508:28)
+    at parserOnIncoming (node:_http_server:1186:12)
+    at HTTPParser.parserOnHeadersComplete (node:_http_common:123:17)

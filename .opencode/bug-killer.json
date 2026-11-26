@@ -1,0 +1,9 @@
+{
+  "logSources": [
+    {
+      "type": "file",
+      "path": "examples/demo-app/app.log",
+      "maxLines": 500
+    }
+  ]
+}
