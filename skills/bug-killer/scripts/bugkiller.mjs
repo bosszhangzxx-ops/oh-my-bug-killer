@@ -2,6 +2,7 @@
 /**
  * bugkiller.mjs — helper CLI for the bug-killer skill.
  * Zero dependencies. Requires Node 18+.
+ * The browser log source uses the built-in WebSocket, so it requires Node 22+.
  *
  * State file: <project>/.bugkiller/state.json
  * Log config: <project>/.opencode/bug-killer.json
@@ -59,7 +60,8 @@ const DEFAULT_CONFIG = {
 const LOG_LINE =
   /^\s*(?:\/\/|#|\*|\/\*)?\s*(?:console\.(?:log|debug|info|warn|error)|log(?:ger)?\.(?:info|debug|warn|error|trace)|System\.out\.print(?:ln)?|print|printf|fmt\.Print(?:ln|f)?|Debug\.Log|LOGGER\.(?:info|debug|warn|error|trace))\b/
 
-const ERROR_LINE = /(\bERROR\b|\bFATAL\b|\bSEVERE\b|\bException\b|Caused by:|\bpanic\b|\bCRITICAL\b)/
+const ERROR_LINE =
+  /(\bERROR\b|\bFATAL\b|\bSEVERE\b|\bException\b|Caused by:|\bpanic\b|\bCRITICAL\b|\[pageerror\]|\[console\.(?:error|warn|assert)\]|\[browser\.(?:error|warning)\])/
 const TIMESTAMP = /(\d{4})-(\d{2})-(\d{2})[ T](\d{2}):(\d{2}):(\d{2})/
 
 /* ------------------------------------------------------------------ */
@@ -249,6 +251,14 @@ function isLogSource(value) {
   if (!value || typeof value !== "object") return false
   if (value.type === "file") return typeof value.path === "string" && value.path.length > 0
   if (value.type === "command") return typeof value.command === "string" && value.command.length > 0
+  if (value.type === "browser") {
+    if (value.url !== undefined && (typeof value.url !== "string" || !value.url.trim())) return false
+    if (value.port !== undefined) {
+      const port = Number(value.port)
+      if (!Number.isInteger(port) || port < 1 || port > 65535) return false
+    }
+    return true
+  }
   return false
 }
 
@@ -344,6 +354,397 @@ async function readCommand(source, project) {
       error: error instanceof Error ? error.message : String(error)
     }
   }
+}
+
+/* ------------------------------------------------------------------ */
+/* browser (CDP) log source                                            */
+/* ------------------------------------------------------------------ */
+
+const CDP_DEFAULT_PORT = 9222
+const CDP_DEFAULT_WAIT_MS = 1200
+const CDP_DEFAULT_MAX_EVENTS = 1000
+
+function browserEndpoint(source) {
+  const raw = typeof source.url === "string" ? source.url.trim() : ""
+  if (raw) {
+    const withScheme = /^[a-z][a-z0-9+.-]*:\/\//i.test(raw) ? raw : `http://${raw}`
+    const url = new URL(withScheme)
+    if (!url.port) url.port = String(CDP_DEFAULT_PORT)
+    return url.origin
+  }
+  const port = Number(source.port)
+  return `http://127.0.0.1:${Number.isInteger(port) && port > 0 ? port : CDP_DEFAULT_PORT}`
+}
+
+function isPageTarget(target) {
+  return (
+    target &&
+    target.type === "page" &&
+    typeof target.webSocketDebuggerUrl === "string" &&
+    /^(https?|file):/i.test(String(target.url || ""))
+  )
+}
+
+async function fetchCdpJson(url, timeoutMs = 4000) {
+  const controller = new AbortController()
+  const timer = setTimeout(() => controller.abort(), timeoutMs)
+  try {
+    const response = await fetch(url, { signal: controller.signal })
+    if (!response.ok) throw new Error(`HTTP ${response.status}`)
+    return await response.json()
+  } finally {
+    clearTimeout(timer)
+  }
+}
+
+function shorten(value, limit = 1000) {
+  const str = String(value)
+  return str.length > limit ? `${str.slice(0, limit)}…` : str
+}
+
+function shortUrl(value) {
+  try {
+    const url = new URL(String(value))
+    return url.protocol === "file:" ? url.pathname : `${url.host}${url.pathname}${url.search}`
+  } catch {
+    return String(value)
+  }
+}
+
+function toEpochMs(value) {
+  const num = Number(value)
+  if (!Number.isFinite(num) || num <= 0) return Date.now()
+  return Math.round(num < 1e12 ? num * 1000 : num)
+}
+
+function formatStamp(value) {
+  const date = new Date(toEpochMs(value))
+  const pad = (num) => String(num).padStart(2, "0")
+  return [
+    `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}`,
+    `${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`
+  ].join(" ")
+}
+
+function serializeRemoteObject(value) {
+  if (!value || typeof value !== "object") return "undefined"
+  if (value.type === "string") return String(value.value ?? "")
+  if (value.unserializableValue !== undefined) return String(value.unserializableValue)
+  if (value.value === null) return "null"
+  if (value.value !== undefined && typeof value.value !== "object") return String(value.value)
+
+  const preview = value.preview
+  if (preview) {
+    const props = Array.isArray(preview.properties)
+      ? preview.properties.map((prop) => `${prop.name}: ${prop.value ?? prop.type}`).join(", ")
+      : ""
+    const tail = preview.overflow ? (props ? ", …" : "…") : ""
+    const description = preview.description || value.description || "Object"
+    const label = description === "Object" ? "" : description
+    return `${label}{${props}${tail}}`
+  }
+  return String(value.description ?? value.type ?? "unknown")
+}
+
+function serializePropertyValue(value) {
+  if (!value || typeof value !== "object") return "undefined"
+  if (value.type === "string") return JSON.stringify(value.value ?? "")
+  return serializeRemoteObject(value)
+}
+
+function formatPropertyPreview(value, properties) {
+  const list = (Array.isArray(properties) ? properties : [])
+    .filter((prop) => prop && typeof prop.name === "string" && !prop.name.startsWith("[["))
+    .filter((prop) => prop.value)
+    .slice(0, 20)
+  if (!list.length) return undefined
+
+  if (value.subtype === "array") {
+    const body = list.map((prop) => shorten(serializePropertyValue(prop.value), 120)).join(", ")
+    const label = value.description && value.description !== "Array" ? `${value.description} ` : ""
+    return `${label}[${body}${list.length === 20 ? ", …" : ""}]`
+  }
+
+  const body = list
+    .map((prop) => `${prop.name}: ${shorten(serializePropertyValue(prop.value), 120)}`)
+    .join(", ")
+  return `{${body}${list.length === 20 ? ", …" : ""}}`
+}
+
+function canPreview(value) {
+  return Boolean(
+    value &&
+      typeof value === "object" &&
+      value.objectId &&
+      value.type === "object" &&
+      (value.subtype === undefined || value.subtype === "array")
+  )
+}
+
+async function serializeConsoleArg(value, sendCommand, budget) {
+  if (!value || typeof value !== "object") return "undefined"
+  if (value.type === "string") return String(value.value ?? "")
+  if (value.unserializableValue !== undefined) return String(value.unserializableValue)
+  if (value.value === null) return "null"
+  if (value.value !== undefined && typeof value.value !== "object") return String(value.value)
+
+  if (canPreview(value) && budget.left > 0) {
+    budget.left--
+    try {
+      const result = await sendCommand("Runtime.getProperties", {
+        objectId: value.objectId,
+        ownProperties: true,
+        generatePreview: true
+      })
+      const preview = formatPropertyPreview(value, result?.result)
+      if (preview) return preview
+    } catch {
+      // 对象预览失败时退回 description
+    }
+  }
+  return serializeRemoteObject(value)
+}
+
+async function formatConsoleEvent(params, sendCommand, budget) {
+  const type = params.type === "warning" ? "warn" : String(params.type || "log")
+  const args = Array.isArray(params.args) ? params.args : []
+  const parts = []
+  for (const arg of args) parts.push(await serializeConsoleArg(arg, sendCommand, budget))
+  const frame = params.stackTrace?.callFrames?.[0]
+  const location =
+    frame && frame.url ? ` @ ${shortUrl(frame.url)}:${Number(frame.lineNumber) + 1}` : ""
+  return `${formatStamp(params.timestamp)} [console.${type}] ${shorten(parts.join(" "))}${location}`
+}
+
+function formatExceptionEvent(params) {
+  const details = params.exceptionDetails || {}
+  const text = details.exception?.description || details.text || "Uncaught exception"
+  const location =
+    details.url ? ` @ ${shortUrl(details.url)}:${Number(details.lineNumber) + 1}` : ""
+  return `${formatStamp(params.timestamp)} [pageerror] ${shorten(text, 1200)}${location}`
+}
+
+function formatBrowserLog(params) {
+  const entry = params.entry || {}
+  const level = String(entry.level || "")
+  if (level !== "error" && level !== "warning") return undefined
+  const source = entry.source ? `[${entry.source}] ` : ""
+  const location = entry.url ? ` @ ${shortUrl(entry.url)}` : ""
+  return `${formatStamp(entry.timestamp)} [browser.${level}] ${source}${shorten(entry.text || "")}${location}`
+}
+
+function captureBrowserTarget(target, waitMs, maxEvents) {
+  const source = `browser ${target.url || target.id}`
+  return new Promise((resolve) => {
+    const events = []
+    const lines = []
+    const pending = new Map()
+    const budget = { left: 50 }
+    let settled = false
+    let finishing = false
+    let truncated = false
+    let socket
+    let timer
+    let openTimer
+    let nextId = 0
+
+    const finish = (error) => {
+      if (settled) return
+      settled = true
+      clearTimeout(timer)
+      clearTimeout(openTimer)
+      for (const entry of pending.values()) entry.reject(new Error("采集已结束"))
+      pending.clear()
+      try {
+        socket?.close()
+      } catch {
+        // already closed
+      }
+      resolve({ source, lines, error })
+    }
+
+    const sendCommand = (method, params = {}, timeoutMs = 1000) =>
+      new Promise((resolveCommand, rejectCommand) => {
+        if (settled) {
+          rejectCommand(new Error("采集已结束"))
+          return
+        }
+        const id = ++nextId
+        const timeout = setTimeout(() => {
+          pending.delete(id)
+          rejectCommand(new Error(`${method} 超时`))
+        }, timeoutMs)
+        pending.set(id, {
+          resolve: (value) => {
+            clearTimeout(timeout)
+            resolveCommand(value)
+          },
+          reject: (error) => {
+            clearTimeout(timeout)
+            rejectCommand(error)
+          }
+        })
+        try {
+          socket.send(JSON.stringify({ id, method, params }))
+        } catch (error) {
+          clearTimeout(timeout)
+          pending.delete(id)
+          rejectCommand(error)
+        }
+      })
+
+    const flush = async () => {
+      if (finishing) return
+      finishing = true
+      clearTimeout(timer)
+      const deadline = Date.now() + 5000
+
+      for (const event of events) {
+        if (settled) return
+        if (Date.now() > deadline) break
+        if (event.kind === "console") {
+          lines.push(await formatConsoleEvent(event.params, sendCommand, budget))
+        } else if (event.kind === "exception") {
+          lines.push(formatExceptionEvent(event.params))
+        } else if (event.kind === "log") {
+          const line = formatBrowserLog(event.params)
+          if (line) lines.push(line)
+        }
+        if (settled) return
+      }
+
+      if (truncated) lines.push(`…（已达到 maxEvents=${maxEvents}，后续事件未采集）`)
+      finish()
+    }
+
+    try {
+      socket = new WebSocket(target.webSocketDebuggerUrl)
+    } catch (error) {
+      resolve({ source, lines, error: error instanceof Error ? error.message : String(error) })
+      return
+    }
+
+    openTimer = setTimeout(() => finish("连接 WebSocket 超时"), 5000)
+    timer = setTimeout(() => finish(), waitMs + 5000)
+
+    socket.onopen = () => {
+      clearTimeout(openTimer)
+      clearTimeout(timer)
+      try {
+        socket.send(JSON.stringify({ id: ++nextId, method: "Runtime.enable" }))
+        socket.send(JSON.stringify({ id: ++nextId, method: "Log.enable" }))
+      } catch (error) {
+        finish(error instanceof Error ? error.message : String(error))
+        return
+      }
+      timer = setTimeout(() => void flush(), waitMs)
+    }
+    socket.onerror = () => finish("WebSocket 连接失败")
+    socket.onclose = () => finish()
+    socket.onmessage = (event) => {
+      if (settled) return
+      let message
+      try {
+        message = JSON.parse(String(event.data))
+      } catch {
+        return
+      }
+
+      if (message.id !== undefined) {
+        const entry = pending.get(message.id)
+        if (entry) {
+          pending.delete(message.id)
+          if (message.error) entry.reject(new Error(message.error.message || "CDP 调用失败"))
+          else entry.resolve(message.result)
+        }
+        return
+      }
+
+      if (finishing) return
+      if (events.length >= maxEvents) {
+        truncated = true
+        void flush()
+        return
+      }
+
+      let kind
+      if (message.method === "Runtime.consoleAPICalled") kind = "console"
+      else if (message.method === "Runtime.exceptionThrown") kind = "exception"
+      else if (message.method === "Log.entryAdded") kind = "log"
+      else return
+      events.push({ kind, params: message.params || {} })
+    }
+  })
+}
+
+async function readBrowserSource(source) {
+  let endpoint
+  try {
+    endpoint = browserEndpoint(source)
+  } catch (error) {
+    return [
+      {
+        source: "browser",
+        lines: [],
+        error: `CDP 地址无效：${error instanceof Error ? error.message : String(error)}`
+      }
+    ]
+  }
+
+  const label = `browser ${endpoint}`
+  if (typeof WebSocket === "undefined") {
+    return [
+      {
+        source: label,
+        lines: [],
+        error: `浏览器日志源需要 Node 22+（当前 ${process.version}），可改用 --command 或手动粘贴`
+      }
+    ]
+  }
+
+  let targets
+  try {
+    targets = await fetchCdpJson(`${endpoint}/json`)
+  } catch (error) {
+    const port = new URL(endpoint).port
+    return [
+      {
+        source: label,
+        lines: [],
+        error: [
+          `连接 CDP 失败（${error instanceof Error ? error.message : String(error)}）`,
+          `请先以 --remote-debugging-port=${port} --user-data-dir=<独立目录> 启动 Chrome/Edge 并打开页面`,
+          "Chrome 136+ 不允许在默认用户目录上开启远程调试"
+        ].join("；")
+      }
+    ]
+  }
+
+  const pages = (Array.isArray(targets) ? targets : []).filter(isPageTarget)
+  const filter = typeof source.urlFilter === "string" ? source.urlFilter.trim() : ""
+  const selected = filter
+    ? pages.filter((target) => `${target.url || ""} ${target.title || ""}`.includes(filter))
+    : pages
+
+  if (!selected.length) {
+    const available = pages.map((target) => target.url).filter(Boolean).slice(0, 6)
+    return [
+      {
+        source: label,
+        lines: [],
+        error: `没有匹配的页面${filter ? `（urlFilter=${filter}）` : ""}${
+          available.length ? `；当前页面：${available.join("、")}` : "；请先在浏览器中打开要复现的页面"
+        }`
+      }
+    ]
+  }
+
+  const waitMs = Math.min(15000, positiveNumber(Number(source.waitMs), CDP_DEFAULT_WAIT_MS))
+  const maxEvents = Math.min(
+    5000,
+    Math.round(positiveNumber(Number(source.maxEvents), CDP_DEFAULT_MAX_EVENTS))
+  )
+  return Promise.all(selected.map((target) => captureBrowserTarget(target, waitMs, maxEvents)))
 }
 
 function makeMarker(prefix, runId, hypothesisId, probeNo) {
@@ -794,9 +1195,19 @@ async function cmdCollect(project, args) {
   }
 
   const config = await readConfig(project)
+  const browserFilter = text(args["browser-filter"]).trim()
   const adHoc = [
     ...arr(args.log).map((path) => ({ type: "file", path: String(path) })),
-    ...arr(args.command).map((command) => ({ type: "command", command: String(command) }))
+    ...arr(args.command).map((command) => ({ type: "command", command: String(command) })),
+    ...arr(args.browser).map((value) => {
+      const raw = text(value).trim()
+      const source = /^\d+$/.test(raw)
+        ? { type: "browser", port: Number(raw) }
+        : raw
+          ? { type: "browser", url: raw }
+          : { type: "browser" }
+      return browserFilter ? { ...source, urlFilter: browserFilter } : source
+    })
   ]
   const sources = adHoc.length ? adHoc : config.logSources
 
@@ -808,6 +1219,8 @@ async function cmdCollect(project, args) {
         `可以在 ${CONFIG_FILE} 中配置 logSources，或直接传：`,
         "  collect --log logs/app.log",
         '  collect --command "docker logs --tail 2000 my-api"',
+        "  collect --browser 9222",
+        '  collect --browser http://127.0.0.1:9222 --browser-filter "localhost:5173"',
         "",
         "也可以让用户把日志粘贴到对话里，再人工分析。"
       ].join("\n")
@@ -831,6 +1244,8 @@ async function cmdCollect(project, args) {
           error: error instanceof Error ? error.message : String(error)
         })
       }
+    } else if (source.type === "browser") {
+      chunks.push(...(await readBrowserSource(source)))
     } else {
       chunks.push(await readCommand(source, project))
     }
@@ -1218,7 +1633,7 @@ function usage() {
     '  probe-add   --hypothesis H1 --file src/a.ts --line 120 --code "userId, status" [--note "..."]',
     "  probe-verify",
     "  repro       --file .bugkiller/steps.json",
-    '  collect     [--log path] [--command "docker logs ..."] [--no-errors] [--max-chars N]',
+    '  collect     [--log path] [--command "docker logs ..."] [--browser [port|url]] [--browser-filter text] [--no-errors] [--max-chars N]',
     "  plan        --file .bugkiller/plan.json",
     "  confirm",
     "  apply",
@@ -1234,7 +1649,8 @@ function usage() {
     "  node bugkiller.mjs status",
     '  node bugkiller.mjs begin --symptom "点击借出后接口 500"',
     "  node bugkiller.mjs probe-verify",
-    "  node bugkiller.mjs collect --log logs/app.log"
+    "  node bugkiller.mjs collect --log logs/app.log",
+    "  node bugkiller.mjs collect --browser 9222 --browser-filter localhost:5173"
   ].join("\n")
 }
 

@@ -207,11 +207,13 @@ node <脚本> repro --file .bugkiller/steps.json
 node <脚本> collect
 ```
 
-如果提示没有日志源，可以让用户配置 `.opencode/bug-killer.json`，或临时传（传了 `--log` / `--command` 时只使用传入的源）：
+如果提示没有日志源，可以让用户配置 `.opencode/bug-killer.json`，或临时传（传了 `--log` / `--command` / `--browser` 时只使用传入的源）：
 
 ```bash
 node <脚本> collect --log logs/app.log
 node <脚本> collect --command "docker logs --tail 2000 my-api"
+node <脚本> collect --browser 9222
+node <脚本> collect --browser http://127.0.0.1:9222 --browser-filter "localhost:5173"
 ```
 
 分析时重点看：
@@ -294,7 +296,7 @@ hypothesize --file ...          提交假设，进入埋点阶段
 probe-add ...                   登记一条埋点，返回 marker 和模板
 probe-verify                    检查所有 marker 是否写入文件
 repro --file ...                记录复现步骤，进入等待复现阶段
-collect [--log|--command]       采集日志并生成分析报告
+collect [--log|--command|--browser] 采集日志并生成分析报告
 plan --file ...                 提交修复方案，等待用户确认
 confirm                         记录用户已确认
 apply                           进入修复阶段
@@ -316,20 +318,35 @@ reset [--force]                 清空调试状态
       "type": "command",
       "command": "docker logs --tail 2000 my-api",
       "timeoutMs": 20000
+    },
+    {
+      "type": "browser",
+      "port": 9222,
+      "urlFilter": "localhost:5173",
+      "waitMs": 1200,
+      "maxEvents": 1000
     }
   ],
   "maxCollectChars": 60000
 }
 ```
 
-相对路径按项目根目录解析。浏览器 console 日志需要用户手动粘贴。
+相对路径按项目根目录解析。浏览器 console 日志可以用 `browser` 源自动抓取，也可以让用户手动粘贴。
+
+`browser` 源通过 CDP 抓取 console、未捕获异常和网络错误，要求：
+
+- Node 22+（内置 WebSocket；`file` / `command` 源仍支持 Node 18+）
+- Chrome 或 Edge 以 `--remote-debugging-port=9222 --user-data-dir=<独立目录>` 启动（Chrome 136+ 不允许在默认用户目录上开启远程调试）
+
+`collect` 连接的是当前页面的 console 缓冲，页面跳转前的日志可能拿不到。连不上 CDP 时退回手动粘贴。
 
 ## 常见错误
 
 - **`hypothesize` 报阶段不对**：先运行 `begin` 记录问题。
 - **`probe-verify` 找不到 marker**：检查日志行是否原样包含 marker，是否被格式化工具改写。
 - **`repro` 报还有埋点没写入**：先补齐并运行 `probe-verify`。
-- **`collect` 说没有日志源**：配置 `logSources`，或用 `--log` / `--command` 临时指定。
+- **`collect` 说没有日志源**：配置 `logSources`，或用 `--log` / `--command` / `--browser` 临时指定。
+- **`--browser` 连接失败**：确认浏览器用 `--remote-debugging-port=9222 --user-data-dir=<独立目录>` 启动、页面已打开，且用的是 Node 22+。
 - **`apply` 被拒绝**：用户还没有确认，先运行 `confirm`；确认必须是用户明确说的。
 - **`cleanup` 有残留**：marker 可能和业务代码在同一行，需要手动删除该日志行。
 - **想放弃当前调试**：先尝试清理；确实要放弃时运行 `reset --force`，它只清状态，不删代码里的日志。
@@ -346,4 +363,5 @@ reset [--force]                 清空调试状态
 - skill 没有硬门禁，无法像插件一样拒绝 `edit` / `write`；必须自觉遵守“确认前不改代码”
 - 一个项目同时只保留一份调试状态，多会话并行会互相覆盖
 - 自动清理只处理“marker 单独占一行”的日志
+- 浏览器日志源需要 Node 22+ 和 Chromium 系浏览器；只采集当前页面的 console 缓冲，跳转前的日志可能丢失
 - 全局安装的副本需要手动更新

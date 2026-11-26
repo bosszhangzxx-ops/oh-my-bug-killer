@@ -60,20 +60,46 @@ skill 会按下面的流程推进：
       "type": "command",
       "command": "docker logs --tail 2000 my-api",
       "timeoutMs": 20000
+    },
+    {
+      "type": "browser",
+      "port": 9222,
+      "urlFilter": "localhost:5173",
+      "waitMs": 1200,
+      "maxEvents": 1000
     }
   ],
   "maxCollectChars": 60000
 }
 ```
 
-相对路径按项目根目录解析。浏览器 console 日志需要手动粘贴到对话里。
+相对路径按项目根目录解析。`browser` 源通过 CDP 抓取浏览器 console，达到条件时会自动采集；连不上时仍可手动粘贴日志。
 
 也可以不配置，采集时临时指定：
 
 ```bash
 node <脚本> collect --log logs/app.log
 node <脚本> collect --command "docker logs --tail 2000 my-api"
+node <脚本> collect --browser 9222
+node <脚本> collect --browser http://127.0.0.1:9222 --browser-filter "localhost:5173"
 ```
+
+### 浏览器 console 日志（CDP）
+
+`browser` 源要求：
+
+- Node 22+（使用内置 WebSocket；`file` / `command` 源仍支持 Node 18+）
+- Chrome 或 Edge 以远程调试方式启动，并指定独立用户目录（Chrome 136+ 不允许在默认用户目录上开启远程调试）：
+
+```powershell
+& "C:\Program Files\Google\Chrome\Application\chrome.exe" `
+  --remote-debugging-port=9222 `
+  --user-data-dir="$env:TEMP\bugkiller-chrome"
+```
+
+在这个浏览器里打开页面、完成复现，然后运行 `collect`。采集内容包括 `console.log/warn/error`、未捕获异常和网络错误。
+
+注意：`collect` 连接的是当前页面的 console 缓冲，页面跳转前的日志可能拿不到。需要覆盖整个流程时，可以用其他工具持续采集，或手动粘贴日志。
 
 ## 状态文件
 
@@ -92,7 +118,7 @@ skill 会在被调试项目里创建：
 
 ## 脚本命令
 
-脚本位于 `skills/bug-killer/scripts/bugkiller.mjs`，零依赖，Node 18+ 可运行。在项目根目录执行：
+脚本位于 `skills/bug-killer/scripts/bugkiller.mjs`，零依赖，Node 18+ 可运行（`browser` 日志源需要 Node 22+）。在项目根目录执行：
 
 ```text
 status                          查看当前阶段、假设、埋点和下一步
@@ -101,7 +127,7 @@ hypothesize --file ...          提交假设，进入埋点阶段
 probe-add ...                   登记一条埋点，返回 marker 和日志模板
 probe-verify                    检查所有 marker 是否写入文件
 repro --file ...                记录复现步骤，进入等待复现阶段
-collect [--log|--command]       采集日志并生成分析报告
+collect [--log|--command|--browser] 采集日志并生成分析报告
 plan --file ...                 提交修复方案，等待用户确认
 confirm                         记录用户已确认
 apply                           进入修复阶段
