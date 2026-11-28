@@ -8,11 +8,14 @@
  * Log config: <project>/.opencode/bug-killer.json
  */
 
-import { exec } from "node:child_process"
+import { exec, spawn } from "node:child_process"
 import { randomBytes } from "node:crypto"
-import { existsSync } from "node:fs"
-import { mkdir, open, readFile, unlink, writeFile } from "node:fs/promises"
+import { createWriteStream, existsSync } from "node:fs"
+import { appendFile, mkdir, open, readFile, readdir, rm, stat, unlink, writeFile } from "node:fs/promises"
+import { createServer } from "node:net"
+import { homedir } from "node:os"
 import { extname, isAbsolute, join, relative, resolve } from "node:path"
+import { fileURLToPath } from "node:url"
 import { promisify } from "node:util"
 
 const execAsync = promisify(exec)
@@ -20,6 +23,11 @@ const execAsync = promisify(exec)
 const STATE_DIR = ".bugkiller"
 const STATE_FILE = join(STATE_DIR, "state.json")
 const CONFIG_FILE = join(".opencode", "bug-killer.json")
+const BROWSER_SESSION_FILE = join(STATE_DIR, "browser-session.json")
+const BROWSER_EVENTS_FILE = join(STATE_DIR, "browser-events.log")
+const BROWSER_LISTEN_LOG = join(STATE_DIR, "browser-listen.log")
+const BROWSER_PROFILE_DIR = join(STATE_DIR, "browser-profile")
+const BROWSER_STOP_FILE = join(STATE_DIR, "browser-stop")
 
 const PHASES = [
   "idle",
@@ -52,10 +60,40 @@ const PHASE_LABEL = {
 const DEFAULT_CONFIG = {
   markerPrefix: "BK",
   logSources: [],
+  browser: { executable: "", kind: "", port: 0, profileDir: "", urlFilter: "" },
   maxLogBytes: 2 * 1024 * 1024,
   maxLogLines: 5000,
   maxCollectChars: 60000
 }
+
+const BROWSER_DEFAULT_POLL_MS = 600
+const BROWSER_DEFAULT_MAX_EVENTS = 20000
+const BROWSER_PREVIEW_BUDGET = 500
+
+const DISCOVER_SKIP_DIRS = new Set([
+  "node_modules",
+  ".git",
+  ".bugkiller",
+  ".next",
+  ".nuxt",
+  "dist",
+  "build",
+  "target",
+  "out",
+  "bin",
+  "obj",
+  ".venv",
+  "venv",
+  "__pycache__",
+  "vendor",
+  "coverage",
+  ".idea",
+  ".vscode",
+  ".gradle"
+])
+const DISCOVER_MAX_DEPTH = 4
+const DISCOVER_MAX_FILES = 2000
+const DISCOVER_MAX_LOGS = 10
 
 const LOG_LINE =
   /^\s*(?:\/\/|#|\*|\/\*)?\s*(?:console\.(?:log|debug|info|warn|error)|log(?:ger)?\.(?:info|debug|warn|error|trace)|System\.out\.print(?:ln)?|print|printf|fmt\.Print(?:ln|f)?|Debug\.Log|LOGGER\.(?:info|debug|warn|error|trace))\b/
@@ -225,7 +263,7 @@ function nextHint(state) {
     case "instrument":
       return "用 probe-add 登记埋点并插入日志，全部完成后运行 probe-verify"
     case "await_repro":
-      return "等待用户复现；用户回复完成后运行 collect"
+      return "等待用户复现；需要浏览器日志时先运行 browser-open；用户回复完成后运行 collect"
     case "collect":
       return "运行 collect 采集日志"
     case "analyze":
@@ -267,9 +305,23 @@ function parseConfig(raw) {
     typeof raw.markerPrefix === "string" && raw.markerPrefix.trim()
       ? raw.markerPrefix.trim().replace(/[^A-Za-z0-9_-]/g, "")
       : "BK"
+  const browser = raw && typeof raw.browser === "object" && raw.browser ? raw.browser : {}
+  const browserPort = Number(browser.port)
   return {
     markerPrefix: prefix || "BK",
     logSources: Array.isArray(raw.logSources) ? raw.logSources.filter(isLogSource) : [],
+    browser: {
+      executable:
+        typeof browser.executable === "string" && browser.executable.trim()
+          ? browser.executable.trim()
+          : "",
+      kind: browser.kind === "chrome" || browser.kind === "edge" ? browser.kind : "",
+      port: Number.isInteger(browserPort) && browserPort > 0 && browserPort <= 65535 ? browserPort : 0,
+      profileDir:
+        typeof browser.profileDir === "string" && browser.profileDir.trim() ? browser.profileDir.trim() : "",
+      urlFilter:
+        typeof browser.urlFilter === "string" && browser.urlFilter.trim() ? browser.urlFilter.trim() : ""
+    },
     maxLogBytes: positiveNumber(raw.maxLogBytes, DEFAULT_CONFIG.maxLogBytes),
     maxLogLines: positiveNumber(raw.maxLogLines, DEFAULT_CONFIG.maxLogLines),
     maxCollectChars: positiveNumber(raw.maxCollectChars, DEFAULT_CONFIG.maxCollectChars)
@@ -283,6 +335,263 @@ async function readConfig(project) {
   } catch {
     return { ...DEFAULT_CONFIG, logSources: [] }
   }
+}
+
+/* ------------------------------------------------------------------ */
+/* project discovery                                                   */
+/* ------------------------------------------------------------------ */
+
+async function readdirSafe(path, options) {
+  try {
+    return await readdir(path, options)
+  } catch {
+    return []
+  }
+}
+
+async function statFile(path) {
+  try {
+    const info = await stat(path)
+    return { size: info.size, mtime: info.mtimeMs }
+  } catch {
+    return { size: 0, mtime: 0 }
+  }
+}
+
+async function walkProjectFiles(root) {
+  const files = []
+  const queue = [{ dir: root, depth: 0 }]
+  let visited = 0
+  while (queue.length) {
+    const current = queue.shift()
+    const entries = await readdirSafe(current.dir, { withFileTypes: true })
+    for (const entry of entries) {
+      if (++visited > DISCOVER_MAX_FILES) return files
+      const full = join(current.dir, entry.name)
+      if (entry.isDirectory()) {
+        if (current.depth >= DISCOVER_MAX_DEPTH) continue
+        if (DISCOVER_SKIP_DIRS.has(entry.name)) continue
+        if (entry.name.startsWith(".")) continue
+        queue.push({ dir: full, depth: current.depth + 1 })
+      } else if (entry.isFile()) {
+        files.push({ path: full, name: entry.name, dir: current.dir, depth: current.depth })
+      }
+    }
+  }
+  return files
+}
+
+function isLogFile(file) {
+  const lower = file.name.toLowerCase()
+  if (lower.endsWith(".log")) return true
+  if (lower === "nohup.out") return true
+  const dirName = (file.dir.split(/[\\/]/).pop() || "").toLowerCase()
+  if (["logs", "log", "app-logs"].includes(dirName)) {
+    return !/\.(?:config|conf|xml|json|ya?ml|properties|ini|toml)$/i.test(lower)
+  }
+  return false
+}
+
+async function detectStacks(project, files) {
+  const stacks = new Map()
+  const evidence = (id, label, item) => {
+    const current = stacks.get(id) || { id, label, evidence: [] }
+    if (!current.evidence.includes(item)) current.evidence.push(item)
+    stacks.set(id, current)
+  }
+
+  const topEntries = await readdirSafe(project, { withFileTypes: true })
+  const topFiles = new Set(topEntries.filter((entry) => entry.isFile()).map((entry) => entry.name))
+  const topDirs = new Set(topEntries.filter((entry) => entry.isDirectory()).map((entry) => entry.name))
+
+  if (topFiles.has("pom.xml")) evidence("java", "Java / Maven", "pom.xml")
+  if (topFiles.has("build.gradle")) evidence("java", "Java / Gradle", "build.gradle")
+  if (topFiles.has("build.gradle.kts")) evidence("java", "Java / Gradle", "build.gradle.kts")
+  if (topDirs.has("src") && files.some((file) => file.name.endsWith(".java"))) {
+    evidence("java", "Java", "src/**/*.java")
+  }
+
+  let pkg
+  if (topFiles.has("package.json")) {
+    try {
+      pkg = JSON.parse(await readFile(join(project, "package.json"), "utf8"))
+    } catch {
+      pkg = undefined
+    }
+  }
+  const deps = { ...(pkg?.dependencies || {}), ...(pkg?.devDependencies || {}) }
+  const nextConfig = [...topFiles].find((name) => /^next\.config\./.test(name))
+  if (deps.next || nextConfig) {
+    evidence("nextjs", "Next.js", deps.next ? "package.json" : nextConfig)
+  } else if (pkg) {
+    evidence("node", "Node.js", "package.json")
+  }
+  if (deps.react) evidence("react", "React", "package.json")
+  if (deps.vue) evidence("vue", "Vue", "package.json")
+  if (deps.vite) evidence("vite", "Vite", "package.json")
+  if (deps.svelte) evidence("svelte", "Svelte", "package.json")
+
+  if (topFiles.has("requirements.txt")) evidence("python", "Python", "requirements.txt")
+  if (topFiles.has("pyproject.toml")) evidence("python", "Python", "pyproject.toml")
+  if (topFiles.has("setup.py")) evidence("python", "Python", "setup.py")
+  if (topFiles.has("Pipfile")) evidence("python", "Python", "Pipfile")
+  if (topFiles.has("manage.py")) evidence("python-django", "Python / Django", "manage.py")
+  if (!stacks.has("python") && files.some((file) => file.name.endsWith(".py") && file.depth <= 1)) {
+    evidence("python", "Python", "*.py")
+  }
+
+  if (topFiles.has("go.mod")) evidence("go", "Go", "go.mod")
+  if (topFiles.has("composer.json")) evidence("php", "PHP", "composer.json")
+  if (topFiles.has("Gemfile")) evidence("ruby", "Ruby", "Gemfile")
+  const dotnet = [...topFiles].find((name) => /\.(csproj|sln)$/i.test(name))
+  if (dotnet) evidence("dotnet", ".NET", dotnet)
+
+  return [...stacks.values()]
+}
+
+async function findLogFiles(project, files, stacks) {
+  const candidates = []
+  for (const file of files) {
+    if (!isLogFile(file)) continue
+    const info = await statFile(file.path)
+    candidates.push({
+      path: relative(project, file.path).replaceAll("\\", "/"),
+      absolute: file.path,
+      size: info.size,
+      mtime: info.mtime,
+      source: "project"
+    })
+  }
+
+  const hasNodeStack = stacks.some((stack) =>
+    ["node", "nextjs", "react", "vue", "vite", "svelte"].includes(stack.id)
+  )
+  if (hasNodeStack) {
+    const pm2Dir = join(homedir(), ".pm2", "logs")
+    for (const entry of await readdirSafe(pm2Dir, { withFileTypes: true })) {
+      if (!entry.isFile() || !entry.name.toLowerCase().endsWith(".log")) continue
+      const full = join(pm2Dir, entry.name)
+      const info = await statFile(full)
+      candidates.push({
+        path: full,
+        absolute: full,
+        size: info.size,
+        mtime: info.mtime,
+        source: "pm2"
+      })
+    }
+  }
+
+  candidates.sort((a, b) => b.mtime - a.mtime)
+  return candidates.slice(0, DISCOVER_MAX_LOGS)
+}
+
+function findTerminalSuggestions(project, files) {
+  const topNames = new Set(files.filter((file) => file.depth === 0).map((file) => file.name))
+  const suggestions = []
+  const rel = (file) => relative(project, file.path).replaceAll("\\", "/")
+
+  const compose = [...topNames].find((name) =>
+    /^(?:docker-)?compose\.ya?ml$/i.test(name)
+  )
+  if (compose) {
+    suggestions.push({
+      command: "docker compose logs --tail 2000 --no-color",
+      reason: "检测到 Docker Compose 配置",
+      file: compose,
+      note: "默认采集全部服务；只想要某个服务时在 logs 后加服务名"
+    })
+  } else if (topNames.has("Dockerfile")) {
+    suggestions.push({
+      command: "docker logs --tail 2000 <容器名>",
+      reason: "检测到 Dockerfile",
+      file: "Dockerfile",
+      note: "需要把 <容器名> 替换成实际运行中的容器"
+    })
+  }
+
+  const pm2Config = [...topNames].find((name) => /^ecosystem\.config\.(?:js|cjs|mjs)$/i.test(name))
+  if (pm2Config) {
+    suggestions.push({
+      command: "pm2 logs --nostream --lines 2000",
+      reason: "检测到 PM2 配置",
+      file: pm2Config,
+      note: "多应用时在 logs 后加应用名"
+    })
+  }
+
+  const k8s = files.find(
+    (file) => /\.ya?ml$/i.test(file.name) && /(deployment|k8s|kube|manifests)/i.test(file.name)
+  )
+  if (k8s) {
+    suggestions.push({
+      command: "kubectl logs --tail=2000 deploy/<名称>",
+      reason: `检测到 Kubernetes 清单 ${rel(k8s)}`,
+      file: rel(k8s),
+      note: "需要替换工作负载名称，并确认 kubeconfig 指向正确集群"
+    })
+  }
+
+  const service = files.find((file) => file.name.endsWith(".service"))
+  if (service) {
+    suggestions.push({
+      command: `journalctl -u ${service.name.replace(/\.service$/, "")} -n 2000 --no-pager`,
+      reason: `检测到 systemd 服务文件 ${service.name}`,
+      file: rel(service),
+      note: "仅在 Linux systemd 环境执行"
+    })
+  }
+
+  return suggestions
+}
+
+async function discoverProject(project) {
+  const files = await walkProjectFiles(project)
+  const stacks = await detectStacks(project, files)
+  const logFiles = await findLogFiles(project, files, stacks)
+  const commands = findTerminalSuggestions(project, files)
+  const browser = stacks.some((stack) =>
+    ["nextjs", "react", "vue", "vite", "svelte"].includes(stack.id)
+  )
+  return { stacks, logFiles, commands, browser }
+}
+
+function recommendedLogSources(discovery) {
+  return discovery.logFiles.slice(0, 5).map((file) => ({
+    type: "file",
+    path: file.path,
+    maxLines: 5000
+  }))
+}
+
+async function applyDiscoveredSources(project, discovery) {
+  const sources = recommendedLogSources(discovery)
+  if (!sources.length) return { written: false, added: 0 }
+
+  const configPath = join(project, CONFIG_FILE)
+  let raw
+  try {
+    raw = JSON.parse(await readFile(configPath, "utf8"))
+  } catch {
+    raw = {}
+  }
+  if (!raw || typeof raw !== "object") raw = {}
+  const existing = Array.isArray(raw.logSources) ? raw.logSources : []
+  const keys = new Set(
+    existing.map((source) => `${source.type}:${source.path || source.command || ""}`)
+  )
+  let added = 0
+  for (const source of sources) {
+    const key = `${source.type}:${source.path}`
+    if (keys.has(key)) continue
+    existing.push(source)
+    keys.add(key)
+    added++
+  }
+  raw.logSources = existing
+  await mkdir(join(project, ".opencode"), { recursive: true })
+  await writeFile(configPath, `${JSON.stringify(raw, null, 2)}\n`, "utf8")
+  return { written: true, added }
 }
 
 /* ------------------------------------------------------------------ */
@@ -460,7 +769,10 @@ function formatPropertyPreview(value, properties) {
   if (!list.length) return undefined
 
   if (value.subtype === "array") {
-    const body = list.map((prop) => shorten(serializePropertyValue(prop.value), 120)).join(", ")
+    const body = list
+      .filter((prop) => prop.name !== "length")
+      .map((prop) => shorten(serializePropertyValue(prop.value), 120))
+      .join(", ")
     const label = value.description && value.description !== "Array" ? `${value.description} ` : ""
     return `${label}[${body}${list.length === 20 ? ", …" : ""}]`
   }
@@ -747,6 +1059,449 @@ async function readBrowserSource(source) {
   return Promise.all(selected.map((target) => captureBrowserTarget(target, waitMs, maxEvents)))
 }
 
+/* ------------------------------------------------------------------ */
+/* browser launcher and persistent listener                            */
+/* ------------------------------------------------------------------ */
+
+function delay(ms) {
+  return new Promise((resolvePromise) => setTimeout(resolvePromise, ms))
+}
+
+function browserCandidates() {
+  if (process.platform === "win32") {
+    const programFiles = process.env["ProgramFiles"] || "C:\\Program Files"
+    const programFilesX86 = process.env["ProgramFiles(x86)"] || "C:\\Program Files (x86)"
+    const localAppData = process.env["LocalAppData"] || ""
+    const list = [
+      { kind: "chrome", path: join(programFiles, "Google", "Chrome", "Application", "chrome.exe") },
+      { kind: "chrome", path: join(programFilesX86, "Google", "Chrome", "Application", "chrome.exe") }
+    ]
+    if (localAppData) {
+      list.push({ kind: "chrome", path: join(localAppData, "Google", "Chrome", "Application", "chrome.exe") })
+    }
+    list.push(
+      { kind: "edge", path: join(programFilesX86, "Microsoft", "Edge", "Application", "msedge.exe") },
+      { kind: "edge", path: join(programFiles, "Microsoft", "Edge", "Application", "msedge.exe") }
+    )
+    return list
+  }
+  if (process.platform === "darwin") {
+    return [
+      { kind: "chrome", path: "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" },
+      { kind: "edge", path: "/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge" }
+    ]
+  }
+  return [
+    { kind: "chrome", path: "google-chrome" },
+    { kind: "chrome", path: "google-chrome-stable" },
+    { kind: "edge", path: "microsoft-edge" },
+    { kind: "edge", path: "microsoft-edge-stable" }
+  ]
+}
+
+async function executableExists(filePath) {
+  if (filePath.includes("/") || filePath.includes("\\")) return existsSync(filePath)
+  try {
+    await execAsync(process.platform === "win32" ? `where ${filePath}` : `command -v ${filePath}`, {
+      timeout: 3000,
+      windowsHide: true
+    })
+    return true
+  } catch {
+    return false
+  }
+}
+
+function browserKindFromPath(filePath) {
+  return /msedge/i.test(filePath) ? "edge" : "chrome"
+}
+
+async function findBrowser(explicit) {
+  const value = String(explicit || "").trim()
+  if (value) {
+    if (/[\\/]/.test(value) || /\.(exe|app)$/i.test(value)) {
+      return existsSync(value) ? { kind: browserKindFromPath(value), path: value } : undefined
+    }
+    const kind = value.toLowerCase()
+    if (kind !== "chrome" && kind !== "edge") return undefined
+    for (const candidate of browserCandidates()) {
+      if (candidate.kind === kind && (await executableExists(candidate.path))) return candidate
+    }
+    return undefined
+  }
+  for (const candidate of browserCandidates()) {
+    if (await executableExists(candidate.path)) return candidate
+  }
+  return undefined
+}
+
+function portInUse(port) {
+  return new Promise((resolvePromise) => {
+    const server = createServer()
+    server.once("error", () => resolvePromise(true))
+    server.once("listening", () => server.close(() => resolvePromise(false)))
+    server.listen(port, "127.0.0.1")
+  })
+}
+
+async function findFreePort(start) {
+  for (let port = start; port < start + 30 && port <= 65535; port++) {
+    if (!(await portInUse(port))) return port
+  }
+  throw new Error(`从端口 ${start} 起找不到可用端口。`)
+}
+
+async function waitForCdp(port, timeoutMs) {
+  const deadline = Date.now() + timeoutMs
+  let lastError
+  while (Date.now() < deadline) {
+    try {
+      const info = await fetchCdpJson(`http://127.0.0.1:${port}/json/version`, 1500)
+      if (info && typeof info.webSocketDebuggerUrl === "string") return info
+    } catch (error) {
+      lastError = error
+    }
+    await delay(300)
+  }
+  throw new Error(
+    `等待 CDP 就绪超时（端口 ${port}）${
+      lastError ? `：${lastError instanceof Error ? lastError.message : String(lastError)}` : ""
+    }`
+  )
+}
+
+async function loadBrowserSession(project) {
+  try {
+    const raw = await readFile(join(project, BROWSER_SESSION_FILE), "utf8")
+    const session = JSON.parse(raw)
+    return session && typeof session === "object" ? session : undefined
+  } catch {
+    return undefined
+  }
+}
+
+async function saveBrowserSession(project, session) {
+  await mkdir(join(project, STATE_DIR), { recursive: true })
+  await writeFile(join(project, BROWSER_SESSION_FILE), `${JSON.stringify(session, null, 2)}\n`, "utf8")
+}
+
+function isProcessAlive(pid) {
+  const value = Number(pid)
+  if (!Number.isInteger(value) || value <= 0) return false
+  try {
+    process.kill(value, 0)
+    return true
+  } catch {
+    return false
+  }
+}
+
+async function waitForProcessExit(pid, timeoutMs) {
+  const deadline = Date.now() + timeoutMs
+  while (Date.now() < deadline) {
+    if (!isProcessAlive(pid)) return true
+    await delay(150)
+  }
+  return !isProcessAlive(pid)
+}
+
+async function stopBrowserListener(project, session) {
+  if (!session || !isProcessAlive(session.listenPid)) return false
+  try {
+    await writeFile(join(project, BROWSER_STOP_FILE), "stop\n", "utf8")
+  } catch {
+    // stop file is only a hint; process.kill below is the fallback
+  }
+  if (await waitForProcessExit(session.listenPid, 6000)) return true
+  try {
+    process.kill(session.listenPid)
+  } catch {
+    // already gone
+  }
+  return waitForProcessExit(session.listenPid, 2000)
+}
+
+async function cleanupBrowserSession(project) {
+  const session = await loadBrowserSession(project)
+  if (session && isProcessAlive(session.listenPid)) {
+    await stopBrowserListener(project, session)
+  }
+  for (const file of [BROWSER_SESSION_FILE, BROWSER_EVENTS_FILE, BROWSER_LISTEN_LOG, BROWSER_STOP_FILE]) {
+    await rm(join(project, file), { force: true })
+  }
+}
+
+async function closeBrowser(port) {
+  if (typeof WebSocket === "undefined") return false
+  let version
+  try {
+    version = await fetchCdpJson(`http://127.0.0.1:${port}/json/version`, 3000)
+  } catch {
+    return false
+  }
+  const endpoint = version?.webSocketDebuggerUrl
+  if (!endpoint) return false
+  return new Promise((resolvePromise) => {
+    let settled = false
+    const done = (value) => {
+      if (settled) return
+      settled = true
+      clearTimeout(timer)
+      try {
+        socket.close()
+      } catch {
+        // already closed
+      }
+      resolvePromise(value)
+    }
+    const socket = new WebSocket(endpoint)
+    const timer = setTimeout(() => done(false), 4000)
+    socket.onopen = () => {
+      try {
+        socket.send(JSON.stringify({ id: 1, method: "Browser.close" }))
+      } catch {
+        done(false)
+      }
+    }
+    socket.onmessage = () => done(true)
+    socket.onclose = () => done(true)
+    socket.onerror = () => done(false)
+  })
+}
+
+function connectBrowserTarget(target, options) {
+  const { onLine, onLog, onClose } = options
+  const budget = { left: Math.round(positiveNumber(Number(options.previewBudget), BROWSER_PREVIEW_BUDGET)) }
+  const pending = new Map()
+  let nextId = 0
+  let closed = false
+  let sequence = Promise.resolve()
+  let socket
+
+  const report = (message) => {
+    if (typeof onLog === "function") onLog(message)
+  }
+
+  const sendCommand = (method, params = {}, timeoutMs = 1500) =>
+    new Promise((resolveCommand, rejectCommand) => {
+      if (closed) {
+        rejectCommand(new Error("连接已关闭"))
+        return
+      }
+      const id = ++nextId
+      const timeout = setTimeout(() => {
+        pending.delete(id)
+        rejectCommand(new Error(`${method} 超时`))
+      }, timeoutMs)
+      pending.set(id, {
+        resolve: (value) => {
+          clearTimeout(timeout)
+          resolveCommand(value)
+        },
+        reject: (error) => {
+          clearTimeout(timeout)
+          rejectCommand(error)
+        }
+      })
+      try {
+        socket.send(JSON.stringify({ id, method, params }))
+      } catch (error) {
+        clearTimeout(timeout)
+        pending.delete(id)
+        rejectCommand(error)
+      }
+    })
+
+  const emit = (params, kind) => {
+    sequence = sequence
+      .then(async () => {
+        if (closed) return
+        let line
+        if (kind === "console") line = await formatConsoleEvent(params, sendCommand, budget)
+        else if (kind === "exception") line = formatExceptionEvent(params)
+        else line = formatBrowserLog(params)
+        if (line && !closed) onLine(line, target)
+      })
+      .catch((error) =>
+        report(
+          `事件处理失败（${target.url || target.id}）：${error instanceof Error ? error.message : String(error)}`
+        )
+      )
+  }
+
+  try {
+    socket = new WebSocket(target.webSocketDebuggerUrl)
+  } catch (error) {
+    report(
+      `WebSocket 创建失败（${target.url || target.id}）：${error instanceof Error ? error.message : String(error)}`
+    )
+    return undefined
+  }
+
+  socket.onopen = () => {
+    report(`已连接页面：${target.url || target.id}`)
+    try {
+      socket.send(JSON.stringify({ id: ++nextId, method: "Runtime.enable" }))
+      socket.send(JSON.stringify({ id: ++nextId, method: "Log.enable" }))
+    } catch (error) {
+      report(`开启 Runtime/Log 失败：${error instanceof Error ? error.message : String(error)}`)
+    }
+  }
+  socket.onerror = () => {
+    // onclose 统一处理
+  }
+  socket.onclose = () => {
+    if (closed) return
+    closed = true
+    for (const entry of pending.values()) entry.reject(new Error("连接已关闭"))
+    pending.clear()
+    report(`页面连接关闭：${target.url || target.id}`)
+    if (typeof onClose === "function") onClose()
+  }
+  socket.onmessage = (event) => {
+    if (closed) return
+    let message
+    try {
+      message = JSON.parse(String(event.data))
+    } catch {
+      return
+    }
+    if (message.id !== undefined) {
+      const entry = pending.get(message.id)
+      if (entry) {
+        pending.delete(message.id)
+        if (message.error) entry.reject(new Error(message.error.message || "CDP 调用失败"))
+        else entry.resolve(message.result)
+      }
+      return
+    }
+    if (message.method === "Runtime.consoleAPICalled") emit(message.params || {}, "console")
+    else if (message.method === "Runtime.exceptionThrown") emit(message.params || {}, "exception")
+    else if (message.method === "Log.entryAdded") emit(message.params || {}, "log")
+  }
+
+  return {
+    close() {
+      if (closed) return
+      closed = true
+      for (const entry of pending.values()) entry.reject(new Error("连接已关闭"))
+      pending.clear()
+      try {
+        socket.close()
+      } catch {
+        // already closed
+      }
+    }
+  }
+}
+
+async function runBrowserListener(project, options) {
+  if (typeof WebSocket === "undefined") {
+    throw new Error(`浏览器监听需要 Node 22+（当前 ${process.version}）`)
+  }
+  const port = positiveNumber(Number(options.port), CDP_DEFAULT_PORT)
+  const pollMs = Math.min(5000, positiveNumber(Number(options.pollMs), BROWSER_DEFAULT_POLL_MS))
+  const maxEvents = Math.min(
+    200000,
+    Math.round(positiveNumber(Number(options.maxEvents), BROWSER_DEFAULT_MAX_EVENTS))
+  )
+  const previewBudget = Math.round(
+    positiveNumber(Number(options.previewBudget), BROWSER_PREVIEW_BUDGET)
+  )
+  const urlFilter = text(options.urlFilter).trim()
+  const stopPath = join(project, BROWSER_STOP_FILE)
+  const eventsPath = join(project, BROWSER_EVENTS_FILE)
+  const logPath = join(project, BROWSER_LISTEN_LOG)
+  await mkdir(join(project, STATE_DIR), { recursive: true })
+
+  const log = (message) => {
+    void appendFile(logPath, `${formatStamp(Date.now())} ${message}\n`, "utf8").catch(() => {})
+  }
+  const stream = createWriteStream(eventsPath, { flags: "a" })
+  let streamError
+  stream.on("error", (error) => {
+    streamError = error
+  })
+
+  const connections = new Map()
+  let lineCount = 0
+  let stopping = false
+  let resolveShutdown
+  const shutdownDone = new Promise((resolvePromise) => {
+    resolveShutdown = resolvePromise
+  })
+
+  const shutdown = async (reason) => {
+    if (stopping) return
+    stopping = true
+    log(`监听停止：${reason}（累计 ${lineCount} 条）`)
+    for (const entry of connections.values()) entry.connection.close()
+    connections.clear()
+    await new Promise((resolvePromise) => stream.end(resolvePromise))
+    resolveShutdown()
+  }
+
+  process.on("SIGTERM", () => void shutdown("signal"))
+  process.on("SIGINT", () => void shutdown("signal"))
+
+  const writeLine = (line, target) => {
+    if (stopping || streamError) return
+    const page = target && target.url ? shortUrl(target.url) : "page"
+    stream.write(`[page ${page}] ${line}\n`)
+    lineCount++
+    if (lineCount >= maxEvents) {
+      log(`达到 maxEvents=${maxEvents}，停止采集`)
+      void shutdown("max_events")
+    }
+  }
+
+  log(`监听启动：端口 ${port}，pid ${process.pid}，轮询 ${pollMs}ms，maxEvents=${maxEvents}`)
+
+  let misses = 0
+  while (!stopping) {
+    if (existsSync(stopPath)) {
+      await shutdown("stop_file")
+      break
+    }
+    let targets
+    try {
+      targets = await fetchCdpJson(`http://127.0.0.1:${port}/json`, 3000)
+    } catch {
+      misses++
+      if (misses >= 10) {
+        await shutdown("browser_unreachable")
+        break
+      }
+      await delay(pollMs)
+      continue
+    }
+    misses = 0
+    const pages = (Array.isArray(targets) ? targets : []).filter((target) => {
+      if (!isPageTarget(target)) return false
+      if (!urlFilter) return true
+      return `${target.url || ""} ${target.title || ""}`.includes(urlFilter)
+    })
+    for (const target of pages) {
+      const existing = connections.get(target.id)
+      if (existing) {
+        if (target.url) existing.target.url = target.url
+        continue
+      }
+      const connection = connectBrowserTarget(target, {
+        previewBudget,
+        onLine: writeLine,
+        onLog: log,
+        onClose: () => connections.delete(target.id)
+      })
+      if (connection) connections.set(target.id, { connection, target })
+    }
+    await delay(pollMs)
+  }
+
+  await shutdownDone
+  log("监听进程退出")
+}
+
 function makeMarker(prefix, runId, hypothesisId, probeNo) {
   return `[${prefix}:${runId}:${hypothesisId}:P${probeNo}]`
 }
@@ -763,7 +1518,7 @@ function templatesFor(file, marker, code) {
   if ([".ts", ".tsx", ".js", ".jsx", ".vue", ".mjs", ".cjs"].includes(ext)) {
     return [`console.log("${marker}", ${values});`]
   }
-  if (ext === ".py") return [`print(f"${marker} {${values}}")`]
+  if (ext === ".py") return [`print(f"${marker} {${values}}", flush=True)`]
   if (ext === ".go") return [`fmt.Println("${marker}", ${values})`]
   if (ext === ".cs") return [`Console.WriteLine($"${marker} {${values}}");`]
   return [`// 在日志中输出: ${marker} <${values}>`]
@@ -1188,6 +1943,251 @@ async function cmdRepro(project, args) {
   )
 }
 
+async function cmdDiscover(project, args) {
+  const discovery = await discoverProject(project)
+  const recommended = { logSources: recommendedLogSources(discovery) }
+
+  if (bool(args.apply)) {
+    discovery.applied = await applyDiscoveredSources(project, discovery)
+  }
+
+  if (bool(args.json)) {
+    console.log(JSON.stringify({ ...discovery, recommended }, null, 2))
+    return
+  }
+
+  const stackLines = discovery.stacks.length
+    ? discovery.stacks.map((stack) => `- ${stack.label}（依据: ${stack.evidence.join(", ")}）`)
+    : ["- 未识别到明确的技术栈"]
+  const logLines = discovery.logFiles.length
+    ? discovery.logFiles.map((file) => {
+        const size =
+          file.size >= 1024 * 1024
+            ? `${(file.size / 1024 / 1024).toFixed(1)} MB`
+            : `${Math.max(1, Math.round(file.size / 1024))} KB`
+        const when = new Date(file.mtime).toLocaleString("zh-CN", { hour12: false })
+        return `- ${file.path}（${file.source === "pm2" ? "PM2" : "项目"}，${size}，${when}）`
+      })
+    : ["- 没有发现日志文件"]
+  const commandLines = discovery.commands.length
+    ? discovery.commands.flatMap((item) => [
+        `- ${item.command}`,
+        `  依据: ${item.file}${item.note ? `；${item.note}` : ""}`
+      ])
+    : ["- 没有检测到容器 / PM2 / systemd / k8s 配置"]
+  const browserLines = discovery.browser
+    ? ["- 检测到前端框架，可用 browser-open 采集浏览器 console"]
+    : ["- 没有检测到前端框架，浏览器采集可能不适用"]
+
+  console.log(
+    [
+      "项目技术栈:",
+      ...stackLines,
+      "",
+      "日志文件（按最近修改排序）:",
+      ...logLines,
+      "",
+      "终端命令建议（确认后手动执行，脚本不会自动运行）:",
+      ...commandLines,
+      "",
+      "控制台:",
+      ...browserLines,
+      "",
+      "推荐日志源配置:",
+      JSON.stringify(recommended, null, 2)
+    ].join("\n")
+  )
+
+  if (discovery.applied) {
+    console.log("")
+    console.log(
+      discovery.applied.written
+        ? `已写入 ${CONFIG_FILE}，新增 ${discovery.applied.added} 个日志文件源。`
+        : "没有可写入的日志文件源。"
+    )
+  } else if (recommended.logSources.length) {
+    console.log("")
+    console.log(`运行 discover --apply 可把以上日志文件写入 ${CONFIG_FILE}。`)
+  }
+}
+
+async function cmdBrowserOpen(project, args) {
+  const state = await requireState(project)
+  if (state.phase !== "await_repro") {
+    fail(
+      `当前阶段是 ${state.phase}（${PHASE_LABEL[state.phase]}），先完成埋点并运行 repro 进入复现阶段，再启动调试浏览器。`
+    )
+  }
+  if (typeof WebSocket === "undefined") {
+    fail(`打开调试浏览器需要 Node 22+（当前 ${process.version}）。`)
+  }
+
+  const active = state.probes.filter((probe) => !probe.removed)
+  if (!active.length) fail("还没有登记任何埋点。先运行 probe-add。")
+
+  const existing = await loadBrowserSession(project)
+  if (existing && isProcessAlive(existing.listenPid)) {
+    fail(
+      [
+        `已有浏览器监听在运行（端口 ${existing.port}，pid ${existing.listenPid}）。`,
+        "直接在该浏览器里复现即可；需要重来先运行 browser-stop。"
+      ].join("\n")
+    )
+  }
+
+  const config = await readConfig(project)
+  const browserHint = text(args.browser).trim() || config.browser.executable || config.browser.kind
+  const found = await findBrowser(browserHint)
+  if (!found) {
+    fail(
+      [
+        `没有找到可用的浏览器${browserHint ? `（${browserHint}）` : ""}。`,
+        "安装 Chrome 或 Edge，或用 --browser <可执行文件路径> 指定。",
+        "也可以在 .opencode/bug-killer.json 中设置 browser.executable。"
+      ].join("\n")
+    )
+  }
+
+  const configuredPort = config.browser.port || CDP_DEFAULT_PORT
+  let port
+  if (args.port !== undefined && args.port !== true) {
+    const requested = Number(args.port)
+    if (!Number.isInteger(requested) || requested < 1 || requested > 65535) fail("--port 无效。")
+    if (await portInUse(requested)) {
+      fail(`端口 ${requested} 已被占用。换一个端口，或去掉 --port 让脚本自动选择。`)
+    }
+    port = requested
+  } else {
+    port = await findFreePort(configuredPort)
+  }
+
+  const profileDir = resolve(
+    project,
+    text(args.profile).trim() || config.browser.profileDir || BROWSER_PROFILE_DIR
+  )
+  await mkdir(profileDir, { recursive: true })
+  await rm(join(project, BROWSER_EVENTS_FILE), { force: true })
+  await rm(join(project, BROWSER_STOP_FILE), { force: true })
+
+  const url = text(args.url).trim()
+  try {
+    const browserProcess = spawn(
+      found.path,
+      [
+        `--remote-debugging-port=${port}`,
+        `--user-data-dir=${profileDir}`,
+        "--no-first-run",
+        "--no-default-browser-check",
+        url || "about:blank"
+      ],
+      { detached: true, stdio: "ignore", windowsHide: false }
+    )
+    browserProcess.unref()
+  } catch (error) {
+    fail(`启动 ${found.kind} 失败：${error instanceof Error ? error.message : String(error)}`)
+  }
+
+  try {
+    await waitForCdp(port, Math.min(60000, positiveNumber(Number(args.wait), 20000)))
+  } catch (error) {
+    fail(
+      [
+        `${found.kind} 已启动，但调试端口没有就绪：${error instanceof Error ? error.message : String(error)}`,
+        "如果浏览器此前已在运行，请先完全退出再重试；也可以换一个 --port。",
+        "Chrome 136+ 不允许在默认用户目录开启远程调试，本脚本已使用独立 user-data-dir。"
+      ].join("\n")
+    )
+  }
+
+  const urlFilter = text(args["browser-filter"]).trim() || config.browser.urlFilter
+  const scriptPath = fileURLToPath(import.meta.url)
+  const listenArgs = [scriptPath, "--project", project, "browser-listen", "--port", String(port)]
+  if (urlFilter) listenArgs.push("--browser-filter", urlFilter)
+  const listener = spawn(process.execPath, listenArgs, {
+    detached: true,
+    stdio: "ignore",
+    cwd: project,
+    windowsHide: true
+  })
+  listener.unref()
+
+  await delay(400)
+  if (!isProcessAlive(listener.pid)) {
+    fail(
+      [
+        "浏览器监听进程启动后立即退出。",
+        `请查看 ${BROWSER_LISTEN_LOG} 排查原因。`,
+        "常见原因：Node 版本低于 22、项目路径不可写。"
+      ].join("\n")
+    )
+  }
+
+  await saveBrowserSession(project, {
+    version: 1,
+    port,
+    browser: found.kind,
+    browserPath: found.path,
+    profileDir,
+    eventsFile: resolve(project, BROWSER_EVENTS_FILE),
+    listenLog: resolve(project, BROWSER_LISTEN_LOG),
+    listenPid: listener.pid,
+    urlFilter: urlFilter || undefined,
+    url: url || undefined,
+    startedAt: Date.now()
+  })
+
+  console.log(
+    [
+      `已启动 ${found.kind}（调试端口 ${port}，监听 pid ${listener.pid}）。`,
+      url ? `已打开：${url}` : "浏览器已打开空白页。",
+      "",
+      "请在打开的浏览器里：",
+      "1. 打开项目地址（前端页面或要复现的页面）",
+      "2. 按复现步骤操作；页面跳转、刷新都会持续记录，不需要开启 DevTools 的保留日志",
+      "",
+      "复现完成后回复“已完成”，然后运行 collect。",
+      `监听日志：${BROWSER_LISTEN_LOG}；采集结果：${BROWSER_EVENTS_FILE}`
+    ].join("\n")
+  )
+}
+
+async function cmdBrowserStop(project, args) {
+  const session = await loadBrowserSession(project)
+  if (!session) {
+    console.log("当前项目没有浏览器监听会话。")
+    return
+  }
+  if (isProcessAlive(session.listenPid)) {
+    const stopped = await stopBrowserListener(project, session)
+    console.log(
+      stopped
+        ? `已停止浏览器监听（pid ${session.listenPid}）。`
+        : `监听进程 ${session.listenPid} 未能正常停止，已尝试强制结束。`
+    )
+  } else {
+    console.log("监听进程已不在运行。")
+  }
+  if (bool(args.close)) {
+    const closed = await closeBrowser(session.port)
+    console.log(
+      closed ? "已请求浏览器关闭。" : `无法通过 CDP 关闭浏览器，请手动关闭（端口 ${session.port}）。`
+    )
+  }
+  session.stoppedAt = Date.now()
+  await saveBrowserSession(project, session)
+  await rm(join(project, BROWSER_STOP_FILE), { force: true })
+}
+
+async function cmdBrowserListen(project, args) {
+  await runBrowserListener(project, {
+    port: args.port,
+    pollMs: args["poll-ms"],
+    maxEvents: args["max-events"],
+    previewBudget: args["preview-budget"],
+    urlFilter: text(args["browser-filter"])
+  })
+}
+
 async function cmdCollect(project, args) {
   const state = await requireState(project)
   if (!["await_repro", "collect", "analyze"].includes(state.phase)) {
@@ -1211,7 +2211,53 @@ async function cmdCollect(project, args) {
   ]
   const sources = adHoc.length ? adHoc : config.logSources
 
-  if (!sources.length) {
+  const session = await loadBrowserSession(project)
+  let browserCapture
+  if (session) {
+    if (isProcessAlive(session.listenPid)) {
+      await stopBrowserListener(project, session)
+      session.stoppedAt = Date.now()
+      await saveBrowserSession(project, session)
+    }
+    const eventsPath = session.eventsFile || resolve(project, BROWSER_EVENTS_FILE)
+    const label = `browser ${session.browser || "cdp"}:${session.port}${
+      session.urlFilter ? ` (${session.urlFilter})` : ""
+    }`
+    try {
+      const chunk = await readTail(eventsPath, config.maxLogBytes, config.maxLogLines)
+      browserCapture = {
+        ...chunk,
+        source: label,
+        note: chunk.lines.length ? "browser-open 持续监听" : "监听期间没有捕获到事件"
+      }
+    } catch (error) {
+      browserCapture = {
+        source: label,
+        lines: [],
+        error: error instanceof Error ? error.message : String(error)
+      }
+    }
+  }
+
+  const browserSources = sources.filter((source) => source.type === "browser")
+  let effectiveSources = session ? sources.filter((source) => source.type !== "browser") : sources
+
+  if (!effectiveSources.length && !browserCapture) {
+    const discovery = await discoverProject(project)
+    const discovered = discovery.logFiles.slice(0, 3)
+    if (discovered.length) {
+      effectiveSources = discovered.map((file) => ({
+        type: "file",
+        path: file.path,
+        maxLines: config.maxLogLines
+      }))
+      console.log(
+        `没有配置日志源，自动使用发现的日志文件：${discovered.map((file) => file.path).join("、")}`
+      )
+    }
+  }
+
+  if (!effectiveSources.length && !browserCapture) {
     fail(
       [
         "没有配置日志源，无法自动采集。",
@@ -1222,6 +2268,7 @@ async function cmdCollect(project, args) {
         "  collect --browser 9222",
         '  collect --browser http://127.0.0.1:9222 --browser-filter "localhost:5173"',
         "",
+        "需要完整浏览器日志时，先在复现前运行 browser-open。",
         "也可以让用户把日志粘贴到对话里，再人工分析。"
       ].join("\n")
     )
@@ -1231,7 +2278,11 @@ async function cmdCollect(project, args) {
   await saveState(project, state)
 
   const chunks = []
-  for (const source of sources) {
+  if (browserCapture) chunks.push(browserCapture)
+  if (session && browserSources.length) {
+    console.log("检测到 browser-open 监听会话，已使用持续监听结果，忽略 --browser 或配置中的 browser 源。")
+  }
+  for (const source of effectiveSources) {
     if (source.type === "file") {
       const path = isAbsolute(source.path) ? source.path : resolve(project, source.path)
       try {
@@ -1516,6 +2567,12 @@ async function cmdFinish(project, args) {
   if (state.phase !== "verify") {
     fail(`当前阶段是 ${state.phase}（${PHASE_LABEL[state.phase]}），需要先完成修复和清理，再标记完成。`)
   }
+  const session = await loadBrowserSession(project)
+  if (session && isProcessAlive(session.listenPid)) {
+    await stopBrowserListener(project, session)
+    session.stoppedAt = Date.now()
+    await saveBrowserSession(project, session)
+  }
   state.phase = "done"
   state.summary = text(args.summary).trim() || undefined
   await saveState(project, state)
@@ -1533,6 +2590,7 @@ async function cmdFinish(project, args) {
 async function cmdReset(project, args) {
   const state = await loadState(project)
   if (!state) {
+    await cleanupBrowserSession(project)
     console.log("当前没有调试状态，无需清空。")
     return
   }
@@ -1547,6 +2605,7 @@ async function cmdReset(project, args) {
     )
   }
 
+  await cleanupBrowserSession(project)
   try {
     await unlink(statePath(project))
   } catch {
@@ -1575,6 +2634,14 @@ async function cmdStatus(project, args) {
   }
 
   const active = state.probes.filter((probe) => !probe.removed)
+  const session = await loadBrowserSession(project)
+  const browserState = session
+    ? {
+        port: session.port,
+        running: isProcessAlive(session.listenPid),
+        eventsFile: session.eventsFile
+      }
+    : null
   if (bool(args.json)) {
     console.log(
       JSON.stringify(
@@ -1586,6 +2653,7 @@ async function cmdStatus(project, args) {
           hypotheses: state.hypotheses,
           probes: active,
           logSources: config.logSources.length,
+          browser: browserState,
           next: nextHint(state),
           updatedAt: state.updatedAt
         },
@@ -1606,6 +2674,10 @@ async function cmdStatus(project, args) {
       )
     : ["- 暂无"]
 
+  const browserLine = browserState
+    ? `浏览器监听: 端口 ${browserState.port}${browserState.running ? "（运行中）" : "（已停止）"}`
+    : "浏览器监听: 未启动"
+
   console.log(
     [
       `阶段: ${state.phase}（${PHASE_LABEL[state.phase]}）`,
@@ -1615,6 +2687,7 @@ async function cmdStatus(project, args) {
       "埋点:",
       ...probeLines,
       `日志源: ${config.logSources.length} 个`,
+      browserLine,
       `下一步: ${nextHint(state)}`
     ].join("\n")
   )
@@ -1632,7 +2705,10 @@ function usage() {
     "  hypothesize --file .bugkiller/hypotheses.json",
     '  probe-add   --hypothesis H1 --file src/a.ts --line 120 --code "userId, status" [--note "..."]',
     "  probe-verify",
+    "  discover    [--json] [--apply]  识别技术栈、日志文件和终端命令建议",
     "  repro       --file .bugkiller/steps.json",
+    "  browser-open [--url <地址>] [--port 9222] [--browser chrome|edge|<exe路径>] [--profile <目录>] [--browser-filter text]",
+    "  browser-stop [--close]",
     '  collect     [--log path] [--command "docker logs ..."] [--browser [port|url]] [--browser-filter text] [--no-errors] [--max-chars N]',
     "  plan        --file .bugkiller/plan.json",
     "  confirm",
@@ -1649,6 +2725,8 @@ function usage() {
     "  node bugkiller.mjs status",
     '  node bugkiller.mjs begin --symptom "点击借出后接口 500"',
     "  node bugkiller.mjs probe-verify",
+    "  node bugkiller.mjs discover --apply",
+    "  node bugkiller.mjs browser-open --url http://localhost:5173",
     "  node bugkiller.mjs collect --log logs/app.log",
     "  node bugkiller.mjs collect --browser 9222 --browser-filter localhost:5173"
   ].join("\n")
@@ -1674,7 +2752,11 @@ const handlers = {
   hypothesize: cmdHypothesize,
   "probe-add": cmdProbeAdd,
   "probe-verify": cmdProbeVerify,
+  discover: cmdDiscover,
   repro: cmdRepro,
+  "browser-open": cmdBrowserOpen,
+  "browser-stop": cmdBrowserStop,
+  "browser-listen": cmdBrowserListen,
   collect: cmdCollect,
   plan: cmdPlan,
   confirm: cmdConfirm,

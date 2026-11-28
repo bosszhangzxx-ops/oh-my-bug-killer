@@ -1,4 +1,8 @@
 {
+  "browser": {
+    "kind": "chrome",
+    "port": 9222
+  },
   "logSources": [
     {
       "type": "file",

@@ -1,0 +1,16 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Bug Killer 浏览器采集 Demo - 详情页</title>
+</head>
+<body>
+  <h1>详情页</h1>
+  <p>这个页面在首页跳转后加载，用于验证跳转后的日志也能继续采集。</p>
+  <script>
+    console.log("详情页加载完成", { page: 2, ok: true })
+    console.log("详情页埋点位置：页面状态对象", { page: 2, ok: true })
+    setTimeout(() => console.log("详情页延迟日志"), 800)
+  </script>
+</body>
+</html>

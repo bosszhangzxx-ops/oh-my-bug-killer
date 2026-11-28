@@ -55,6 +55,9 @@ node ~/.config/opencode/skills/bug-killer/scripts/bugkiller.mjs status
 
 - `<项目>/.bugkiller/state.json`：当前调试状态，不要手动编辑
 - `<项目>/.bugkiller/*.json`：临时载荷文件
+- `<项目>/.bugkiller/browser-session.json`：调试浏览器监听会话
+- `<项目>/.bugkiller/browser-events.log`：持续采集的浏览器日志
+- `<项目>/.bugkiller/browser-profile/`：调试浏览器用户目录
 - `<项目>/.opencode/bug-killer.json`：日志源配置（可选）
 
 ---
@@ -99,7 +102,15 @@ node <脚本> begin --symptom '补充后的完整描述' --notes '频率、环�
 
 ### 第 2 步：诊断与假设（diagnose）
 
-用 `grep` / `read` 定位相关代码，沿调用链确认：
+先运行 `discover` 判断项目技术栈和可用日志源：
+
+```bash
+node <脚本> discover
+```
+
+它会列出识别到的技术栈、候选日志文件、终端命令建议（不会自动执行），以及是否适合浏览器采集。需要把发现的日志文件写入配置时运行 `discover --apply`。
+
+然后用 `grep` / `read` 定位相关代码，沿调用链确认：
 
 - 请求入口、参数校验、分支条件
 - 状态变更、事务边界、异步回调
@@ -193,11 +204,24 @@ node <脚本> probe-verify
 node <脚本> repro --file .bugkiller/steps.json
 ```
 
-脚本会校验所有 marker 已就位，打印 ASCII 复现流程。把流程完整展示给用户，然后**停止**：
+脚本会校验所有 marker 已就位，打印 ASCII 复现流程。
+
+需要浏览器 console 日志时（前端问题、前后端联调），紧接着启动调试浏览器：
+
+```bash
+node <脚本> browser-open
+node <脚本> browser-open --url http://localhost:5173
+```
+
+- 自动查找 Chrome，找不到再用 Edge；用独立用户目录启动，不依赖用户日常浏览器
+- 后台持续采集 console、未捕获异常和错误日志，页面跳转、刷新都不会丢
+- 不需要开启 DevTools 的保留日志
+
+把复现流程和浏览器操作指引一起展示给用户，然后**停止**：
 
 - 不要继续分析
 - 不要修改代码
-- 告诉用户操作完成后回复“已完成”
+- 告诉用户在这个浏览器里打开项目地址、完成复现，然后回复“已完成”
 
 ### 第 5 步：采集与分析（collect / analyze）
 
@@ -207,6 +231,8 @@ node <脚本> repro --file .bugkiller/steps.json
 node <脚本> collect
 ```
 
+如果之前运行过 `browser-open`，`collect` 会自动停止监听并把持续采集的浏览器日志一起纳入报告，不需要额外传参。
+
 如果提示没有日志源，可以让用户配置 `.opencode/bug-killer.json`，或临时传（传了 `--log` / `--command` / `--browser` 时只使用传入的源）：
 
 ```bash
@@ -215,6 +241,14 @@ node <脚本> collect --command "docker logs --tail 2000 my-api"
 node <脚本> collect --browser 9222
 node <脚本> collect --browser http://127.0.0.1:9222 --browser-filter "localhost:5173"
 ```
+
+`--browser` 是一次性抓取，只用于连接已经以调试模式启动的浏览器；需要覆盖页面跳转、刷新时用 `browser-open` 在复现前启动监听。
+
+按技术栈选择采集方式：
+
+- **日志文件**：优先使用 `discover` 发现的日志，或 `--log` 指定；没有配置时 `collect` 会自动采用发现的文件
+- **终端输出**：Docker、PM2、systemd、k8s 用 `--command` 执行 `discover` 给出的建议命令；本地开发进程只输出到终端时，让用户把启动输出重定向到文件，再用 `--log`
+- **控制台**：前端问题用 `browser-open`，复现前后的 console 日志都会保留
 
 分析时重点看：
 
@@ -295,7 +329,10 @@ begin --symptom "..."           开始或补充问题
 hypothesize --file ...          提交假设，进入埋点阶段
 probe-add ...                   登记一条埋点，返回 marker 和模板
 probe-verify                    检查所有 marker 是否写入文件
+discover [--json] [--apply]     识别技术栈、日志文件和终端命令建议
 repro --file ...                记录复现步骤，进入等待复现阶段
+browser-open [--url ...]        启动调试浏览器并持续采集浏览器日志
+browser-stop [--close]          停止浏览器日志监听，可选关闭浏览器
 collect [--log|--command|--browser] 采集日志并生成分析报告
 plan --file ...                 提交修复方案，等待用户确认
 confirm                         记录用户已确认
@@ -312,41 +349,47 @@ reset [--force]                 清空调试状态
 ```json
 {
   "markerPrefix": "BK",
+  "browser": {
+    "kind": "chrome",
+    "port": 9222,
+    "urlFilter": "localhost:5173"
+  },
   "logSources": [
     { "type": "file", "path": "logs/app.log", "maxLines": 5000 },
     {
       "type": "command",
       "command": "docker logs --tail 2000 my-api",
       "timeoutMs": 20000
-    },
-    {
-      "type": "browser",
-      "port": 9222,
-      "urlFilter": "localhost:5173",
-      "waitMs": 1200,
-      "maxEvents": 1000
     }
   ],
   "maxCollectChars": 60000
 }
 ```
 
-相对路径按项目根目录解析。浏览器 console 日志可以用 `browser` 源自动抓取，也可以让用户手动粘贴。
+相对路径按项目根目录解析。`browser` 段用于 `browser-open`：`kind` 为 `chrome` 或 `edge`，也可以用 `executable` 指定可执行文件路径；`port` 是起始端口，被占用时自动往后找；`urlFilter` 只采集 URL 或标题匹配的页面。
 
-`browser` 源通过 CDP 抓取 console、未捕获异常和网络错误，要求：
+浏览器日志要求：
 
 - Node 22+（内置 WebSocket；`file` / `command` 源仍支持 Node 18+）
-- Chrome 或 Edge 以 `--remote-debugging-port=9222 --user-data-dir=<独立目录>` 启动（Chrome 136+ 不允许在默认用户目录上开启远程调试）
+- 本机安装 Chrome 或 Edge，`browser-open` 会自动检测，Chrome 优先
 
-`collect` 连接的是当前页面的 console 缓冲，页面跳转前的日志可能拿不到。连不上 CDP 时退回手动粘贴。
+`browser-open` 使用独立 user-data-dir 和自动选择的端口启动浏览器，后台持续采集，页面跳转、刷新期间的日志会保留。
+
+`collect --browser` 保留一次性抓取模式，用于连接已经以 `--remote-debugging-port=9222 --user-data-dir=<独立目录>` 启动的浏览器；这种模式只拿到当前页面的 console 缓冲，跳转前的日志可能缺失。
 
 ## 常见错误
 
 - **`hypothesize` 报阶段不对**：先运行 `begin` 记录问题。
 - **`probe-verify` 找不到 marker**：检查日志行是否原样包含 marker，是否被格式化工具改写。
 - **`repro` 报还有埋点没写入**：先补齐并运行 `probe-verify`。
-- **`collect` 说没有日志源**：配置 `logSources`，或用 `--log` / `--command` / `--browser` 临时指定。
+- **`collect` 说没有日志源**：配置 `logSources`，或用 `--log` / `--command` / `--browser` 临时指定；需要完整浏览器日志时先运行 `browser-open`。
+- **`discover` 没找到日志文件**：确认项目日志是否落盘、位置是否被跳过目录排除；仍然找不到时用 `--log` 直接指定。
+- **`discover` 给了终端命令但没执行**：这是预期行为，确认容器/服务名称后手动传给 `collect --command`。
 - **`--browser` 连接失败**：确认浏览器用 `--remote-debugging-port=9222 --user-data-dir=<独立目录>` 启动、页面已打开，且用的是 Node 22+。
+- **`browser-open` 找不到浏览器**：安装 Chrome/Edge，或用 `--browser <可执行文件路径>` 指定。
+- **`browser-open` 调试端口未就绪**：先完全退出已经运行的浏览器，或换一个 `--port`。
+- **浏览器日志没抓到**：确认在复现前就运行了 `browser-open`；`chrome://` 等内部页面不采集；查看 `.bugkiller/browser-listen.log`。
+- **监听进程残留**：运行 `browser-stop`，必要时加 `--close` 关闭浏览器。
 - **`apply` 被拒绝**：用户还没有确认，先运行 `confirm`；确认必须是用户明确说的。
 - **`cleanup` 有残留**：marker 可能和业务代码在同一行，需要手动删除该日志行。
 - **想放弃当前调试**：先尝试清理；确实要放弃时运行 `reset --force`，它只清状态，不删代码里的日志。
@@ -363,5 +406,7 @@ reset [--force]                 清空调试状态
 - skill 没有硬门禁，无法像插件一样拒绝 `edit` / `write`；必须自觉遵守“确认前不改代码”
 - 一个项目同时只保留一份调试状态，多会话并行会互相覆盖
 - 自动清理只处理“marker 单独占一行”的日志
-- 浏览器日志源需要 Node 22+ 和 Chromium 系浏览器；只采集当前页面的 console 缓冲，跳转前的日志可能丢失
+- `discover` 最多扫描 2000 个文件、4 层目录，跳过依赖和构建目录；终端命令只给建议，不自动执行
+- 浏览器日志需要 Node 22+ 和 Chrome/Edge；`browser-open` 启动的是独立 profile，需要重新登录项目
+- 页面关闭瞬间的极少日志可能丢失；正常跳转、刷新不影响
 - 全局安装的副本需要手动更新
